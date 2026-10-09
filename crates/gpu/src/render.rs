@@ -639,7 +639,7 @@ pub fn render(
     lap("masks", &mut t, &mut cx);
 
     // 5. per-pixel stage
-    let fp = FinishParams::new(s, &plan.frame, info, w, h, plan.px_per_long, prep.air, req.space);
+    let fp = FinishParams::new(s, &plan.frame, info, w, h, prep.air, req.space);
     let present = Present {
         clarity: prep.clarity.is_some(),
         texture: prep.texture.is_some(),

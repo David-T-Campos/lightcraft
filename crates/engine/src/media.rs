@@ -62,7 +62,7 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 22;
+pub const RENDER_CACHE_VERSION: u64 = 23;
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -884,6 +884,22 @@ pub fn content_key(p: &Photo) -> String {
     }
 }
 
+fn photo_grain_seed(p: &Photo) -> u32 {
+    let hash = Hasher128::new().str(&content_key(p)).finish().0;
+    let folded = (hash as u64) ^ ((hash >> 64) as u64);
+    let seed = (folded as u32) ^ ((folded >> 32) as u32);
+    if seed == 0 { 0x6d2b_79f5 } else { seed }
+}
+
+fn with_photo_grain_seed(p: &Photo, settings: Arc<DevelopSettings>) -> Arc<DevelopSettings> {
+    if settings.grain.amount <= 0.0 || settings.grain.seed != 0 || !settings.section_enabled("effects") {
+        return settings;
+    }
+    let mut seeded = (*settings).clone();
+    seeded.grain.seed = photo_grain_seed(p);
+    Arc::new(seeded)
+}
+
 pub fn source_info(p: &Photo) -> SourceInfo {
     // Procedural demo scenes are scene-referred HDR (like raw files): use the filmic tone map.
     if matches!(p.source, Source::Demo { .. }) {
@@ -956,6 +972,7 @@ impl crate::Session {
             }
             (self.media.rendered.clone(), k.finish())
         });
+        let settings = with_photo_grain_seed(&p, settings);
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
@@ -977,8 +994,9 @@ impl crate::Session {
     /// A render of `id` with `settings` in place of its own, fitting `max_w × max_h` (the loupe's
     /// temporary preview while hovering a preset or profile; nothing is committed or cached).
     pub fn preview_job(&mut self, id: PhotoId, max_w: usize, max_h: usize, apply_crop: bool, settings: &DevelopSettings) -> Option<RenderJob> {
+        let p = self.catalog.photo(id)?.clone();
         let mut job = self.render_job(id, max_w, max_h, false, apply_crop)?;
-        job.settings = Arc::new(settings.clone());
+        job.settings = with_photo_grain_seed(&p, Arc::new(settings.clone()));
         job.key = settings.hash64() ^ ((max_w as u64) << 40) ^ ((max_h as u64) << 20) ^ (apply_crop as u64) ^ (job.level as u64) << 60;
         Some(job)
     }
@@ -1006,6 +1024,7 @@ impl crate::Session {
         let level = SourceLevel::Thumb;
         let source = self.media.source_ref(&p, level);
         let ck = Self::variant_key(&p, settings, edge);
+        let settings = with_photo_grain_seed(&p, Arc::new(settings.clone()));
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
@@ -1015,7 +1034,7 @@ impl crate::Session {
             source,
             origin: p.source.clone(),
             info: source_info(&p),
-            settings: Arc::new(settings.clone()),
+            settings,
             request: RenderRequest { apply_crop: true, ..RenderRequest::fit(edge, edge) },
             key: (ck.0 as u64) ^ ((ck.0 >> 64) as u64),
             cache: Some((self.media.rendered.clone(), ck)),
@@ -1051,6 +1070,7 @@ impl crate::Session {
         let level = SourceLevel::for_size(needed as usize);
         let source = self.media.source_ref(&p, level);
         let ck = Self::variant_key(&p, &settings, edge);
+        let settings = with_photo_grain_seed(&p, Arc::new(settings));
         Some(RenderJob {
             request_id: 0,
             cache_generation: self.media.rendered.generation(),
@@ -1060,7 +1080,7 @@ impl crate::Session {
             source,
             origin: p.source.clone(),
             info: source_info(&p),
-            settings: Arc::new(settings),
+            settings,
             request: RenderRequest { apply_crop: true, ..RenderRequest::fit(edge, edge) },
             key: (ck.0 as u64) ^ ((ck.0 >> 64) as u64),
             cache: Some((self.media.rendered.clone(), ck)),
@@ -1350,6 +1370,26 @@ mod thumbnail_hash_tests {
         s.thumb_job(PhotoId(1), 256).unwrap();
         assert_eq!(s.media.settings_hashes.computations, 3);
     }
+    #[test]
+    fn automatic_grain_seed_is_stable_per_photo_and_explicit_seed_wins() {
+        let mut s = session();
+        let mut grain = DevelopSettings::default();
+        grain.grain.amount = 50.0;
+        let a = s.preview_job(PhotoId(1), 256, 256, true, &grain).unwrap();
+        let b = s.preview_job(PhotoId(1), 1024, 1024, true, &grain).unwrap();
+        assert_ne!(a.settings.grain.seed, 0);
+        assert_eq!(a.settings.grain.seed, b.settings.grain.seed);
+
+        let p = Photo::new(PhotoId(2), Source::File { path: "other-fixture.jpg".into() }, "other-fixture.jpg", "JPEG", 6000, 4000, "2026-01-01");
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        let other = s.preview_job(PhotoId(2), 256, 256, true, &grain).unwrap();
+        assert_ne!(a.settings.grain.seed, other.settings.grain.seed);
+
+        grain.grain.seed = 17;
+        let explicit = s.preview_job(PhotoId(1), 256, 256, true, &grain).unwrap();
+        assert_eq!(explicit.settings.grain.seed, 17);
+    }
+
     #[test]
     fn hash_cache_is_bounded_weak_and_shared_settings_remain_independent() {
         let mut hashes = SettingsHashes::default();

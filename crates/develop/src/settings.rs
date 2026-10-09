@@ -452,7 +452,7 @@ pub struct Grain {
     pub amount: f64,
     pub size: f64,
     pub roughness: f64,
-    /// Seed for the procedural grain (stable per photo).
+    /// Seed for the procedural grain. Zero asks the app to derive a stable seed from the photo.
     pub seed: u32,
 }
 

@@ -121,6 +121,17 @@ fn the_vignette_belongs_to_the_frame_not_the_window() {
     check("vignette middle", &s, MID, 2, 0.2);
 }
 
+// Given grain, a window samples the same absolute output-pixel grain as the whole frame
+#[test]
+fn grain_is_anchored_to_the_whole_output_pixel_grid() {
+    let mut s = DevelopSettings::default();
+    controls::set(&mut s, "grain.amount", 70.0);
+    controls::set(&mut s, "grain.size", 65.0);
+    controls::set(&mut s, "grain.roughness", 80.0);
+    s.grain.seed = 0x1234_5678;
+    check("grain", &s, MID, 2, 0.2);
+}
+
 // Given spatial adjustments, the window agrees away from its halo
 #[test]
 fn spatial_adjustments_agree_inside_the_halo() {

@@ -84,25 +84,47 @@ fn vignette(s: &DevelopSettings) -> Option<Vig> {
     })
 }
 
-/// Hash constants of [`grain_noise`] (shared with the GPU kernel).
+/// Hash constants of the grain generator (shared with the GPU kernel).
 pub const GRAIN_HASH: [u32; 4] = [0x8da6_b343, 0xd816_3841, 0xcb1a_b31f, 0x5bd1_e995];
+
+#[inline]
+fn grain_hash(i: i32, j: i32, seed: u32) -> f32 {
+    let mut v = (i as u32).wrapping_mul(GRAIN_HASH[0]) ^ (j as u32).wrapping_mul(GRAIN_HASH[1]) ^ seed.wrapping_mul(GRAIN_HASH[2]);
+    v ^= v >> 13;
+    v = v.wrapping_mul(GRAIN_HASH[3]);
+    v ^= v >> 15;
+    (v & 0xffff) as f32 / 32768.0 - 1.0
+}
 
 #[inline]
 fn grain_noise(x: f32, y: f32, seed: u32) -> f32 {
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = (x - x0, y - y0);
-    let h = |i: i32, j: i32| {
-        let mut v = (i as u32).wrapping_mul(GRAIN_HASH[0]) ^ (j as u32).wrapping_mul(GRAIN_HASH[1]) ^ seed.wrapping_mul(GRAIN_HASH[2]);
-        v ^= v >> 13;
-        v = v.wrapping_mul(GRAIN_HASH[3]);
-        v ^= v >> 15;
-        (v & 0xffff) as f32 / 32768.0 - 1.0
-    };
     let (i, j) = (x0 as i32, y0 as i32);
     let (u, v) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
-    let a = h(i, j) + (h(i + 1, j) - h(i, j)) * u;
-    let b = h(i, j + 1) + (h(i + 1, j + 1) - h(i, j + 1)) * u;
+    let a = grain_hash(i, j, seed) + (grain_hash(i + 1, j, seed) - grain_hash(i, j, seed)) * u;
+    let b = grain_hash(i, j + 1, seed) + (grain_hash(i + 1, j + 1, seed) - grain_hash(i, j + 1, seed)) * u;
     a + (b - a) * v
+}
+
+#[inline]
+fn grain_sample(x: f32, y: f32, scale: f32, rough: f32, seed: u32) -> f32 {
+    let (gx, gy) = (x * scale, y * scale);
+    let fine_scale = 1.8 + rough * 1.4;
+    let fine_weight = rough * 0.45;
+    let speck_weight = rough * 0.15;
+    let coarse_weight = 1.0 - fine_weight - speck_weight;
+    let coarse = grain_noise(gx, gy, seed);
+    let fine = grain_noise(gx * fine_scale + 17.0, gy * fine_scale - 11.0, seed ^ 0xa511_e9b3);
+    let speck = grain_hash(x.floor() as i32, y.floor() as i32, seed ^ 0x63d8_35f1);
+    coarse * coarse_weight + fine * fine_weight + speck * speck_weight
+}
+
+#[inline]
+fn grain_luminance_weight(lum: f32) -> f32 {
+    let lum = lum.clamp(0.0, 1.0);
+    let mid = 4.0 * lum * (1.0 - lum);
+    0.18 + 0.82 * mid
 }
 
 /// Number of per-mask terms in [`mask_terms`].
@@ -181,7 +203,7 @@ pub struct FinishParams {
     pub air_pre: f32,
     pub gain: f32,
     pub ev: f32,
-    /// Grain: amount, cell size (px), roughness, seed.
+    /// Grain: amount, inverse cell size in output pixels, roughness, seed.
     pub grain: Option<(f32, f32, f32, u32)>,
     /// Output px → normalized oriented coordinates.
     pub out_to_norm: lightcraft_geom::Affine,
@@ -216,8 +238,9 @@ impl FinishParams {
         let ev = s.light.exposure as f32;
         let gain = 2f32.powf(ev);
         let grain = (s.grain.amount > 0.0 && effects).then(|| {
-            let cell = (0.0006 + (s.grain.size / 100.0) as f32 * 0.0024) * px_per_long as f32;
-            ((s.grain.amount / 100.0) as f32 * 0.13, cell.max(0.6), (s.grain.roughness / 100.0) as f32, s.grain.seed)
+            let size = (s.grain.size / 100.0).clamp(0.0, 1.0) as f32;
+            let cell = 1.0 + size * 2.5;
+            ((s.grain.amount / 100.0) as f32 * 0.13, 1.0 / cell, (s.grain.roughness / 100.0).clamp(0.0, 1.0) as f32, s.grain.seed)
         });
         let calibration = s.section_enabled("calibration");
         FinishParams {
@@ -345,8 +368,6 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
         (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
     let terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
-    let out_to_norm = fp.out_to_norm;
-    let long = fp.ow.max(fp.oh);
     let [vx, vy, vw, vh] = fp.view;
     // the vignette belongs to the whole output frame, not to the window being drawn
     let aspect = vw / vh;
@@ -561,14 +582,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
             }
-            if let Some((amt, cell, rough, seed)) = *grain {
-                let n = out_to_norm.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
-                let (gx, gy) = ((n.x * fp.ow) as f32 / long as f32, (n.y * fp.oh) as f32 / long as f32);
-                let sc = fp.px_per_long as f32 / cell;
-                let mut g = grain_noise(gx * sc, gy * sc, seed);
-                g = g * (1.0 - rough * 0.5) + grain_noise(gx * sc * 2.3, gy * sc * 2.3, seed ^ 0x55) * rough * 0.7;
+            if let Some((amt, scale, rough, seed)) = *grain {
+                let px_x = vx + x as f32 + 0.5;
+                let px_y = vy + y as f32 + 0.5;
+                let g = grain_sample(px_x, px_y, scale, rough, seed);
                 let lum = 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
-                let k = amt * g * (0.35 + 2.6 * lum * (1.0 - lum));
+                let k = amt * g * grain_luminance_weight(lum);
                 e = e.map(|v| v + k);
             }
             let e = match &p_lut {
@@ -695,6 +714,34 @@ mod tests {
         // luma is kept
         let y = |e: [f32; 3]| 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
         assert!((y(r) - y(after)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn grain_size_is_in_output_pixels() {
+        let mut s = DevelopSettings::default();
+        s.grain.amount = 50.0;
+        s.grain.size = 60.0;
+        let frame = Frame::new(6000, 4000, &s, true);
+        let a = FinishParams::new(&s, &frame, &SourceInfo::default(), 600, 400, 0.1, 0.0, OutputSpace::Srgb).grain.unwrap_or_default();
+        let b = FinishParams::new(&s, &frame, &SourceInfo::default(), 6000, 4000, 1.0, 0.0, OutputSpace::Srgb).grain.unwrap_or_default();
+        assert_eq!(a.1, b.1, "render dimensions must not change grain size in pixels");
+        assert!((a.1 - 1.0 / (1.0 + 0.6 * 2.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grain_is_deterministic_without_short_period_repetition() {
+        let a = grain_sample(53.5, 37.5, 0.7, 0.8, 0x1234_5678);
+        assert_eq!(a, grain_sample(53.5, 37.5, 0.7, 0.8, 0x1234_5678));
+        assert_ne!(a, grain_sample(309.5, 37.5, 0.7, 0.8, 0x1234_5678));
+        assert_ne!(a, grain_sample(53.5, 37.5, 0.7, 0.8, 0x1234_5679));
+    }
+
+    #[test]
+    fn grain_is_strongest_in_midtones() {
+        let (black, mid, white) = (grain_luminance_weight(0.0), grain_luminance_weight(0.5), grain_luminance_weight(1.0));
+        assert!((mid - 1.0).abs() < 1e-6);
+        assert!(mid > black * 5.0 && mid > white * 5.0);
+        assert_eq!(black, white);
     }
 
     #[test]

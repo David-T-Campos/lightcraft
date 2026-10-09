@@ -228,6 +228,25 @@ fn grain_noise(x: f32, y: f32, seed: u32) -> f32 {
     return a + (b - a) * v;
 }
 
+fn grain_sample(x: f32, y: f32, scale: f32, rough: f32, seed: u32) -> f32 {
+    let gx = x * scale;
+    let gy = y * scale;
+    let fine_scale = 1.8 + rough * 1.4;
+    let fine_weight = rough * 0.45;
+    let speck_weight = rough * 0.15;
+    let coarse_weight = 1.0 - fine_weight - speck_weight;
+    let coarse = grain_noise(gx, gy, seed);
+    let fine = grain_noise(gx * fine_scale + 17.0, gy * fine_scale - 11.0, seed ^ 0xa511e9b3u);
+    let speck = ghash(i32(floor(x)), i32(floor(y)), seed ^ 0x63d835f1u);
+    return coarse * coarse_weight + fine * fine_weight + speck * speck_weight;
+}
+
+fn grain_luminance_weight(lum: f32) -> f32 {
+    let l = clamp(lum, 0.0, 1.0);
+    let mid = 4.0 * l * (1.0 - l);
+    return 0.18 + 0.82 * mid;
+}
+
 fn enc8(v: f32) -> u32 {
     return u32(clamp(v, 0.0, 1.0) * 255.0 + 0.5);
 }
@@ -499,17 +518,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     if (pu(F_GRAIN) != 0u) {
-        let px = f32(x) + 0.5;
-        let py = f32(y) + 0.5;
-        let gx = pf(F_GRAIN_AFF) * px + pf(F_GRAIN_AFF + 2u) * py + pf(F_GRAIN_AFF + 4u);
-        let gy = pf(F_GRAIN_AFF + 1u) * px + pf(F_GRAIN_AFF + 3u) * py + pf(F_GRAIN_AFF + 5u);
+        let px = pf(F_VIG_VIEW) + f32(x) + 0.5;
+        let py = pf(F_VIG_VIEW + 1u) + f32(y) + 0.5;
         let sc = pf(F_GRAIN_SC);
         let rough = pf(F_GRAIN_ROUGH);
         let seed = pu(F_GRAIN_SEED);
-        var g = grain_noise(gx * sc, gy * sc, seed);
-        g = g * (1.0 - rough * 0.5) + grain_noise(gx * sc * 2.3, gy * sc * 2.3, seed ^ 0x55u) * rough * 0.7;
+        let g = grain_sample(px, py, sc, rough, seed);
         let lum = 0.2126 * e.x + 0.7152 * e.y + 0.0722 * e.z;
-        let k = pf(F_GRAIN_AMT) * g * (0.35 + 2.6 * lum * (1.0 - lum));
+        let k = pf(F_GRAIN_AMT) * g * grain_luminance_weight(lum);
         e = e + k;
     }
     e = vec3<f32>(out_encode(e.x), out_encode(e.y), out_encode(e.z));
